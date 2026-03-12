@@ -1,27 +1,32 @@
 import os, json, requests, torch
+import numpy as np
 from langdetect import detect
 from groq import Groq
 from dotenv import load_dotenv
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from lime.lime_text import LimeTextExplainer
 
 load_dotenv()
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 groq_client    = Groq(api_key=GROQ_API_KEY)
 
-# ── LAYER 1: Load your trained XLM-RoBERTa model ──────
+# ── LAYER 1: Load XLM-RoBERTa ─────────────────────────
 print("Loading XLM-RoBERTa model from HuggingFace...")
 MODEL_NAME = "Sonia66/multilingual-fake-news-detector"
 tokenizer  = AutoTokenizer.from_pretrained(MODEL_NAME)
 nlp_model  = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
 nlp_model.eval()
 print("✅ XLM-RoBERTa loaded!")
-print("✅ Fake News Detector ready — 3 layers active!")
+
+# ── LIME Explainer ─────────────────────────────────────
+explainer = LimeTextExplainer(class_names=["REAL", "FAKE"])
+print("✅ Fake News Detector ready — 3 layers + LIME active!")
 
 # ── LAYER 1: XLM-RoBERTa inference ────────────────────
 def xlm_roberta_analyze(text):
     try:
-        inputs  = tokenizer(
+        inputs = tokenizer(
             text[:512],
             return_tensors="pt",
             truncation=True,
@@ -29,10 +34,10 @@ def xlm_roberta_analyze(text):
             padding=True
         )
         with torch.no_grad():
-            outputs = nlp_model(**inputs)
-            probs   = torch.softmax(outputs.logits, dim=1)
-            fake_prob = probs[0][1].item()  # probability of FAKE
-            real_prob = probs[0][0].item()  # probability of REAL
+            outputs   = nlp_model(**inputs)
+            probs     = torch.softmax(outputs.logits, dim=1)
+            fake_prob = probs[0][1].item()
+            real_prob = probs[0][0].item()
 
         verdict    = "FAKE" if fake_prob > 0.5 else "REAL"
         confidence = fake_prob if verdict == "FAKE" else real_prob
@@ -46,7 +51,43 @@ def xlm_roberta_analyze(text):
         print(f"XLM-RoBERTa error: {e}")
         return {"verdict": "UNKNOWN", "confidence": 50.0, "fake_prob": 50.0, "real_prob": 50.0}
 
-# ── LAYER 2: Groq Llama-70B reasoning ─────────────────
+# ── LIME Explainability ────────────────────────────────
+def get_lime_explanation(text):
+    try:
+        def predict_proba(texts):
+            results = []
+            for t in texts:
+                inputs = tokenizer(
+                    t[:512],
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=256,
+                    padding=True
+                )
+                with torch.no_grad():
+                    outputs = nlp_model(**inputs)
+                    probs   = torch.softmax(outputs.logits, dim=1)
+                results.append(probs[0].numpy())
+            return np.array(results)
+
+        exp = explainer.explain_instance(
+            text[:512],
+            predict_proba,
+            num_features=8,
+            num_samples=100
+        )
+        lime_words = exp.as_list(label=1)
+        explanation = [
+            {"word": word, "contribution": round(float(score), 4)}
+            for word, score in lime_words
+        ]
+        explanation.sort(key=lambda x: abs(x["contribution"]), reverse=True)
+        return explanation
+    except Exception as e:
+        print(f"LIME error: {e}")
+        return []
+
+# ── LAYER 2: Groq Llama-70B ────────────────────────────
 def groq_analyze(text, lang):
     try:
         prompt = f"""You are an expert fake news detector with 10 years experience.
@@ -85,8 +126,7 @@ Article: {text[:2000]}"""
             messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
-        raw  = response.choices[0].message.content.strip()
-        # Extract JSON
+        raw   = response.choices[0].message.content.strip()
         start = raw.find("{")
         end   = raw.rfind("}") + 1
         data  = json.loads(raw[start:end])
@@ -110,7 +150,6 @@ def fact_check(text):
         claims = data.get("claims", [])
         if not claims:
             return {"found": False, "score": 50.0, "sources": []}
-        # Found matching fact checks
         sources = []
         fake_count, real_count = 0, 0
         for claim in claims[:3]:
@@ -146,21 +185,22 @@ def detect_fake_news(text):
     layer2 = groq_analyze(text, lang)
     layer3 = fact_check(text)
 
-    # Convert verdicts to fake probability scores
+    # Convert to fake probability scores
     l1_fake_score = layer1["fake_prob"]
     l2_fake_score = layer2["confidence"] if layer2["verdict"] == "FAKE" else (100 - layer2["confidence"])
 
     # Weighted ensemble
     if layer3["found"]:
-        # Fact check found — use all 3 layers
         l3_fake_score = layer3["score"]
         final_score   = (l1_fake_score * 0.35) + (l2_fake_score * 0.50) + (l3_fake_score * 0.15)
     else:
-        # No fact check — use layer 1 + layer 2
         final_score = (l1_fake_score * 0.35) + (l2_fake_score * 0.65)
 
     verdict    = "FAKE" if final_score > 50 else "REAL"
     confidence = round(final_score if verdict == "FAKE" else (100 - final_score), 2)
+
+    # LIME explanation
+    lime_explanation = get_lime_explanation(text)
 
     return {
         "verdict":            verdict,
@@ -169,9 +209,10 @@ def detect_fake_news(text):
         "red_flags":          layer2["red_flags"],
         "explanation":        layer2["reasoning"],
         "fact_check_sources": layer3["sources"],
+        "lime_explanation":   lime_explanation,
         "layer_scores": {
-            "xlm_roberta":  round(l1_fake_score, 2),
+            "xlm_roberta":    round(l1_fake_score, 2),
             "groq_llama_70b": round(l2_fake_score, 2),
-            "fact_check":   round(layer3["score"], 2)
+            "fact_check":     round(layer3["score"], 2)
         }
     }
